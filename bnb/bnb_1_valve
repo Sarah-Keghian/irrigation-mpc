@@ -1,0 +1,279 @@
+import cProfile
+import heapq
+import numpy as np
+import matplotlib.pyplot as plt
+from pyscipopt import Model, quicksum, SCIP_STATUS
+import time
+
+
+class Node:
+    def __init__(self, model, fixed_variables, fixed_values, objective=None):
+        self.objective = objective
+        self.is_pruned = False
+        self.fixed_variables = fixed_variables
+        self.fixed_values = fixed_values
+        self.solution = None
+        self.is_feasible = None
+        self.model = model
+
+    def branch(self, uk, a, b, d, Np, ymin, ymax, y0):
+        """
+        Creates 2 nodes by creating models with uk fixed (==0 and ==1)
+        """
+        fixed_var_1 = self.fixed_variables.copy()
+        fixed_var_2 = self.fixed_variables.copy()
+        fixed_var_1.append(uk)
+        fixed_var_2.append(uk)
+
+        fixed_val_1 = self.fixed_values.copy()
+        fixed_val_2 = self.fixed_values.copy()
+        fixed_val_1.append(0)
+        fixed_val_2.append(1)
+
+        m1 = Branch_and_Bound.create_model(
+            a, b, d, Np, ymin, ymax, y0, fixed_var_1, fixed_val_1
+        )
+        m2 = Branch_and_Bound.create_model(
+            a, b, d, Np, ymin, ymax, y0, fixed_var_2, fixed_val_2
+        )
+
+        n1 = Node(m1, fixed_var_1, fixed_val_1)
+        n2 = Node(m2, fixed_var_2, fixed_val_2)
+
+        n1.solve_lp()
+        n2.solve_lp()
+
+        return n1, n2
+
+    def get_non_integer_var(self, Np):
+        """
+        Return:
+        None if the integer variables are integers
+        uk if an integer variable (uk) is continuous
+        """
+
+        for i in range(Np):
+            var_name = f"u_{i}"
+            val = self.solution[var_name]
+            if (
+                abs(val - round(val)) > 1e-6
+            ):  # Tolérance pour les variables fractionnaires
+                return var_name
+        return None
+
+    def solve_lp(self):
+
+        self.model.optimize()
+        if self.model.getStatus() != "optimal":
+            self.is_feasible = False
+            self.objective = float("inf")
+            # print("here ?", self.model.getStatus())
+            return
+        else:
+            self.is_feasible = True
+            res = {var.name: self.model.getVal(var) for var in self.model.getVars()}
+            self.objective = self.model.getObjVal()
+            # print("objective", self.objective)
+            self.solution = res
+            return res
+
+    def __lt__(self, other):
+        """Allows Nodes to be compared for heapq"""
+        # We want a min-heap, so lower objective is 'less than'
+        return self.objective < other.objective
+
+
+class Branch_and_Bound:
+    def __init__(self, a, b, d, Np=20, ymin=0.4, ymax=0.7, y0=0.7, tolerance=0.0001):
+
+        model = Branch_and_Bound.create_model(a, b, d, Np, ymin, ymax, y0, [], [])
+
+        self.default_node = Node(
+            model=None, fixed_variables=[], fixed_values=[], objective=float("inf")
+        )
+        self.root = Node(model=model, fixed_variables=[], fixed_values=[])
+        self.incumbent = self.default_node
+        self.best_bound = self.root
+        self.tolerance = tolerance
+        self.queue = []
+        heapq.heappush(self.queue, self.root)
+        self.a = a
+        self.b = b
+        self.d = d
+        self.Np = Np
+        self.ymin = ymin
+        self.ymax = ymax
+        self.y0 = y0
+        self.optimal_solution = None
+        self.optimal_obj = None
+        self.milp_leaves = []
+        self.runtime = None
+
+    def run(self):
+        start = time.perf_counter()
+        self.root.solve_lp()
+        while self.queue:
+            # print(self.queue)
+            node = heapq.heappop(self.queue)
+            # print(self.queue)
+
+            if not node.is_feasible:
+                node.is_pruned = True
+                # print("got_pruned")
+            else:
+                if node.objective >= self.incumbent.objective:
+                    # print("got_pruned2")
+                    node.is_pruned = True
+                if (
+                    abs(self.best_bound.objective - self.incumbent.objective)
+                    <= self.tolerance
+                ):
+                    print(self.best_bound.objective, self.incumbent.objective)
+                    print("early stop")
+                    print(self.incumbent.solution)
+                    self.optimal_solution = self.incumbent.solution
+                    self.optimal_obj = self.incumbent.objective
+                    end = time.perf_counter()
+                    self.runtime = end - start
+                    return self.incumbent.solution
+
+            if not node.is_pruned:
+                uk = node.get_non_integer_var(self.Np)
+                # print(uk)
+                if uk is None:  # node satisfies the MILP
+                    if node.objective <= self.incumbent.objective:
+                        self.incumbent = node
+
+                    node.is_pruned = True
+                    heapq.heappush(self.milp_leaves, node)
+                else:
+                    n1, n2 = node.branch(
+                        uk=uk,
+                        a=self.a,
+                        b=self.b,
+                        d=self.d,
+                        y0=self.y0,
+                        Np=self.Np,
+                        ymin=self.ymin,
+                        ymax=self.ymax,
+                    )
+                    # print("RAM après suppression du modèle :", memory_mb(), "MB")
+
+                    heapq.heappush(self.queue, n1)
+                    heapq.heappush(self.queue, n2)
+                    # print("queue", self.queue)
+
+                self.best_bound = min(
+                    self.queue + self.milp_leaves,
+                )
+
+        if self.incumbent == self.default_node:
+            # print("Problem Infeasible")
+            end = time.perf_counter()
+            self.runtime = end - start
+            return None
+        print("end")
+        self.optimal_solution = self.incumbent.solution
+        self.optimal_obj = self.incumbent.objective
+        end = time.perf_counter()
+        self.runtime = end - start
+        return self.optimal_solution
+
+    def create_model(a, b, d, Np, ymin, ymax, y0, fixed_var, fixed_val):
+        model = Model()
+        u = []
+        y = []
+        w = []
+        delta = []
+
+        for i in range(Np):
+            u.append(model.addVar(vtype="C", lb=0, ub=1, name=f"u_{i}"))
+            y.append(model.addVar(vtype="C", lb=ymin, ub=ymax, name=f"y_{i}"))
+            w.append(model.addVar(vtype="C", lb=0, ub=1, name=f"w_{i}"))
+            delta.append(model.addVar(vtype="C", lb=0, ub=1, name=f"delta_{i}"))
+
+        # Define initial moisture
+        model.addCons(y[0] == y0)
+
+        for k in range(d):
+            # We consider no valve opened from 0 to d-1 steps
+            model.addCons(u[k] == 0)
+            # We consider no valve opened before step 0
+            model.addCons(delta[k] == 0)
+            # Model constraint & we consider no valve opening from 0 to d-1 steps
+            model.addCons(y[k + 1] == a * y[k])
+            # Mc Cormick's constraints (same as saying m.addConstr(w[k] == 0))
+            model.addCons(w[k] >= 0)
+            model.addCons(w[k] >= (delta[k] - 1) + y[k])
+            model.addCons(w[k] <= y[k])
+            model.addCons(w[k] <= delta[k])
+        for k in range(d, Np):
+            # Delta definition constraint
+            model.addCons(delta[k] == u[k - d])
+            # Mc Cormick's constraints
+            model.addCons(w[k] >= 0)
+            model.addCons(w[k] >= (delta[k] - 1) + y[k])
+            model.addCons(w[k] <= y[k])
+            model.addCons(w[k] <= delta[k])
+        for k in range(d, Np - 1):
+            # Model constraint
+            model.addCons(y[k + 1] == a * y[k] + (b - a) * w[k] + (1 - b) * delta[k])
+
+        # We want to minimize the total number of valve that openened during the prediction horizon
+        model.setObjective(quicksum(u[k] for k in range(d, Np)), sense="minimize")
+        var_dict = {var.name: var for var in model.getVars()}
+
+        for var_name, value in zip(fixed_var, fixed_val):
+            v = var_dict[var_name]
+            model.addCons(v == value)
+
+        model.hideOutput()  # Hide text
+
+        return model
+
+    def formatted_solution(self):
+        u_vals = [self.optimal_solution[f"u_{i}"] for i in range(self.Np)]
+        y_vals = [self.optimal_solution[f"y_{i}"] for i in range(self.Np)]
+        w_vals = [self.optimal_solution[f"w_{i}"] for i in range(self.Np)]
+        delta_vals = [self.optimal_solution[f"delta_{i}"] for i in range(self.Np)]
+        formatted_solution = {
+            "u": u_vals,
+            "y": y_vals,
+            "w": w_vals,
+            "delta": delta_vals,
+        }
+        return formatted_solution
+
+    def plot_result(self):
+        sol = self.formatted_solution()
+        plt.figure()
+        plt.scatter(list(range(self.Np)), sol["u"])
+        plt.grid(True, linestyle="--", linewidth=0.5)
+        plt.xticks(list(range(self.Np)))
+        plt.title("Valve activation schedule")
+        plt.xlabel("Time")
+        plt.ylabel("Valve activation")
+        # chemin = os.path.join(dossier, "valve_activation2.png")
+        # plt.savefig(chemin)
+
+        plt.figure()
+        plt.grid(True, linestyle="--", linewidth=0.5)
+        plt.xlabel("Time")
+        plt.ylabel("Soil moisture level")
+        plt.xticks(list(range(self.Np)))
+        plt.plot(list(range(self.Np)), sol["y"], marker="x")
+        plt.title(f"Moisture evolution in soil of parameter a={self.a}, b={self.b}")
+        # chemin = os.path.join(dossier, "moisture_evolution2.png")
+        # plt.savefig(chemin)
+
+        plt.show()
+
+
+bnb = Branch_and_Bound(0.95, 0.8, 2, Np=20)
+bnb.run()
+print(bnb.formatted_solution())
+print("Optimal Objective : ", bnb.optimal_obj)
+print("runtime : ", bnb.runtime)
+# bnb.plot_result()
+
+# cProfile.run("bnb.run()")
